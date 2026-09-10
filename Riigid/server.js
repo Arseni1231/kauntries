@@ -1,11 +1,9 @@
-
 const express = require("express");
-const mysql = require("mysql2/promise");
 const bcrypt = require("bcrypt");
 const cors = require("cors");
+const admin = require('firebase-admin'); // Перенесли импорт наверх
 
 const app = express();
-
 
 app.use(cors({
     origin: ["http://localhost:3000", "http://localhost:3001"],
@@ -13,65 +11,80 @@ app.use(cors({
 }));
 
 app.use(express.json());
-
-
 app.use("/flags", express.static("public/flags"));
 
 async function startServer() {
     try {
-      
-        const db = await mysql.createPool({
-            host: "localhost",
-            user: "root",
-            password: "", 
-            database: "country",
+        // 1. ИНИЦИАЛИЗАЦИЯ FIREBASE (Вместо старого mysql.createPool)
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount),
+            databaseURL: process.env.FIREBASE_DATABASE_URL
         });
 
-  
+        const db = admin.database();
+        console.log("Успешное подключение к Firebase Realtime Database!");
 
-        
+        // ==========================================
+        // 2. МАРШРУТЫ ПРИЛОЖЕНИЯ
+        // ==========================================
+
+        // РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ
         app.post("/register", async (req, res) => {
             try {
                 const { username, email, password } = req.body;
                 if (!username || !email || !password) {
-                    return res.json({ 
-                        success: false, message: "Все поля обязательны"
-                 });
+                    return res.json({ success: false, message: "Все поля обязательны" });
+                }
+
+                // В Firebase мы проверяем дубликаты вручную
+                const usersRef = db.ref("users");
+                const snapshot = await usersRef.orderByChild("username").equalTo(username).once("value");
+                if (snapshot.exists()) {
+                    return res.json({ success: false, message: "Имя пользователя уже занято" });
                 }
 
                 const hash = await bcrypt.hash(password, 10);
-                await db.query(
-                    "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
-                    [username, email, hash]
-                );
+                
+                // Создаем новый уникальный ID для пользователя в Firebase
+                const newUserRef = usersRef.push();
+                await newUserRef.set({
+                    id: newUserRef.key,
+                    username,
+                    email,
+                    password_hash: hash,
+                    score: 0 // Сразу задаем начальные очки для лидерборда
+                });
 
                 res.json({ success: true, message: "Регистрация успешна! Теперь войдите." });
             } catch (e) {
-                if (e.code === 'ER_DUP_ENTRY') {
-                    res.json({ success: false, message: "Имя пользователя или email уже заняты" });
-                } else {
-                    res.json({ success: false, message: "Ошибка: " + e.message });
-                }
+                res.json({ success: false, message: "Ошибка: " + e.message });
             }
         });
 
+        // АВТОРИЗАЦИЯ (ВХОД)
         app.post("/login", async (req, res) => {
             try {
                 const { username, password } = req.body;
-                const [rows] = await db.query("SELECT * FROM users WHERE username = ?", [username]);
+                
+                const usersRef = db.ref("users");
+                const snapshot = await usersRef.orderByChild("username").equalTo(username).once("value");
 
-                if (rows.length === 0) {
+                if (!snapshot.exists()) {
                     return res.json({ success: false, message: "Пользователь не найден" });
                 }
 
-                const user = rows[0];
-                const valid = await bcrypt.compare(password, user.password_hash);
+                // Достаем объект пользователя из структуры Firebase
+                const userData = snapshot.val();
+                const userId = Object.keys(userData)[0];
+                const user = userData[userId];
 
+                const valid = await bcrypt.compare(password, user.password_hash);
                 if (!valid) {
                     return res.json({ success: false, message: "Неверный пароль" });
                 }
 
-          
                 res.json({
                     success: true,
                     user: {
@@ -85,26 +98,32 @@ async function startServer() {
             }
         });
 
-  
+        // ЛИДЕРБОРД / ВЫВОД ПОЛЬЗОВАТЕЛЕЙ НА ЭКРАН (То, что просил учитель)
         app.get("/users", async (req, res) => {
             try {
-           
-                const [rows] = await db.query(`
-                    SELECT 
-                        u.id, 
-                        u.username, 
-                        COALESCE(l.total_score, 0) AS score 
-                    FROM users u
-                    LEFT JOIN leaderboard l ON u.id = l.user_id
-                    ORDER BY score DESC
-                `);
-                res.json(rows);
+                const usersRef = db.ref("users");
+                const snapshot = await usersRef.once("value");
+                const usersData = snapshot.val();
+
+                let usersList = [];
+                if (usersData) {
+                    usersList = Object.values(usersData).map(u => ({
+                        id: u.id,
+                        username: u.username,
+                        score: u.score || 0
+                    }));
+                    // Сортируем топ игроков по очкам (от большего к меньшему)
+                    usersList.sort((a, b) => b.score - a.score);
+                }
+
+                res.json(usersList);
             } catch (err) {
                 console.error("Ошибка в GET /users:", err.message);
                 res.status(500).json({ success: false });
             }
         });
 
+        // ОБНОВЛЕНИЕ РЕЗУЛЬТАТОВ В ЛИДЕРБОРДЕ
         app.post("/leaderboard", async (req, res) => {
             try {
                 const { user_id, score } = req.body;
@@ -112,13 +131,12 @@ async function startServer() {
                     return res.status(400).json({ success: false });
                 }
 
-            
-                await db.query(
-                    `INSERT INTO leaderboard (user_id, total_score, updated_at)
-                     VALUES (?, ?, NOW())
-                     ON DUPLICATE KEY UPDATE total_score = total_score + ?, updated_at = NOW()`,
-                    [user_id, score, score]
-                );
+                const userScoreRef = db.ref(`users/${user_id}/score`);
+                const snapshot = await userScoreRef.once("value");
+                const currentScore = snapshot.val() || 0;
+
+                // Прибавляем новые очки к старым
+                await userScoreRef.set(currentScore + score);
 
                 res.json({ success: true });
             } catch (err) {
@@ -127,20 +145,28 @@ async function startServer() {
             }
         });
 
-   
+        // ПОЛУЧЕНИЕ ВСЕХ СТРАН И ФЛАГОВ
         app.get("/flags", async (req, res) => {
             try {
-                const [rows] = await db.query("SELECT id, country_name, flag_url, capital, region FROM countries");
-                res.json(rows);
+                const countriesRef = db.ref("countries");
+                const snapshot = await countriesRef.once("value");
+                const countriesData = snapshot.val();
+
+                const countriesList = countriesData ? Object.values(countriesData) : [];
+                res.json(countriesList);
             } catch (err) {
                 res.status(500).json({ success: false });
             }
         });
 
-
+        // СЛУЧАЙНЫЙ КВИЗ (ВОПРОС И 4 ВАРИАНТА ОТВЕТА)
         app.get("/quiz/random", async (req, res) => {
             try {
-                const [allCountries] = await db.query("SELECT id, country_name, flag_url FROM countries");
+                const countriesRef = db.ref("countries");
+                const snapshot = await countriesRef.once("value");
+                const countriesData = snapshot.val();
+
+                const allCountries = countriesData ? Object.values(countriesData) : [];
                 if (allCountries.length < 4) return res.status(400).json({ success: false });
 
                 const correct = allCountries[Math.floor(Math.random() * allCountries.length)];
@@ -158,39 +184,29 @@ async function startServer() {
             }
         });
 
+        // ФАКТЫ О СТРАНАХ
         app.get("/facts", async (req, res) => {
             try {
-                const [rows] = await db.query(`
-                    SELECT f.id, f.fact, c.country_name, c.id AS country_id
-                    FROM facts f
-                    JOIN countries c ON f.country_id = c.id
-                `);
-                res.json(rows);
+                const factsRef = db.ref("facts");
+                const snapshot = await factsRef.once("value");
+                const factsData = snapshot.val();
+
+                const factsList = factsData ? Object.values(factsData) : [];
+                res.json(factsList);
             } catch (err) {
                 res.status(500).json({ success: false });
             }
         });
 
-        app.listen(5000, () => {
-            console.log("Сервер запущен: http://localhost:5000");
-            console.log("Лидерборд доступен: http://localhost:5000/users");
+        // Запуск прослушивания порта (на Render используется process.env.PORT)
+        const PORT = process.env.PORT || 5000;
+        app.listen(PORT, () => {
+            console.log(`Сервер запущен на порту: ${PORT}`);
         });
 
     } catch (err) {
         console.error("Критическая ошибка запуска сервера:", err.message);
     }
-
-    const admin = require('firebase-admin');
-
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        databaseURL: process.env.FIREBASE_DATABASE_URL
-    });
-
-    const db = admin.database();
 }
 
 startServer();
